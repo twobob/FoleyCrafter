@@ -1689,15 +1689,18 @@ def scale(old_value, old_min, old_max, new_min, new_max):
     return new_value
 
 
-def read_frames_with_moviepy(video_path, max_frame_nums=None):
-    clip = VideoFileClip(video_path)
-    duration = clip.duration
+def read_frames_with_moviepy(video_path, max_frame_nums=150):
+    from moviepy.editor import VideoFileClip
     frames = []
-    for frame in clip.iter_frames():
+    video = VideoFileClip(video_path)
+    duration = video.duration
+    for frame in video.iter_frames():
         frames.append(frame)
-    if max_frame_nums is not None:
+    frames = np.array(frames)
+    if max_frame_nums is not None and len(frames) > max_frame_nums:
         frames_idx = np.linspace(0, len(frames) - 1, max_frame_nums, dtype=int)
-    return np.array(frames)[frames_idx, ...], duration
+        frames = frames[frames_idx, ...]
+    return frames, duration
 
 
 def read_frames_with_moviepy_resample(video_path, save_path):

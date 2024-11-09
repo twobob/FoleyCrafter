@@ -11,7 +11,7 @@ import soundfile as sf
 import torch
 import torchvision
 from huggingface_hub import snapshot_download
-from moviepy.editor import AudioFileClip, VideoFileClip
+from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
@@ -59,7 +59,9 @@ class FoleyController:
         # config dirs
         self.basedir = os.getcwd()
         self.model_dir = os.path.join(self.basedir, args.ckpt)
-        self.savedir = os.path.join(self.basedir, args.save_path, datetime.now().strftime("Gradio-%Y-%m-%dT%H-%M-%S"))
+        self.savedir = os.path.join(
+            self.basedir, args.save_path, datetime.now().strftime("Gradio-%Y-%m-%dT%H-%M-%S")
+        )
         self.savedir_sample = os.path.join(self.savedir, "sample")
         os.makedirs(self.savedir_sample, exist_ok=True)
 
@@ -70,34 +72,33 @@ class FoleyController:
         self.load_model()
 
     def load_model(self):
-        gr.Info("Start Load Models...")
         print("Start Load Models...")
 
         # download ckpt
         pretrained_model_name_or_path = "auffusion/auffusion-full-no-adapter"
-        if not os.path.isdir(pretrained_model_name_or_path):
+        if not os.path.isdir(osp.join(self.model_dir, "auffusion")):
             pretrained_model_name_or_path = snapshot_download(
                 pretrained_model_name_or_path, local_dir=osp.join(self.model_dir, "auffusion")
             )
 
         fc_ckpt = "ymzhang319/FoleyCrafter"
-        if not os.path.isdir(fc_ckpt):
-            fc_ckpt = snapshot_download(fc_ckpt, local_dir=self.model_dir)
+        if not os.path.isdir(osp.join(self.model_dir, "FoleyCrafter")):
+            fc_ckpt = snapshot_download(fc_ckpt, local_dir=osp.join(self.model_dir, "FoleyCrafter"))
 
         # set model config
-        temporal_ckpt_path = osp.join(self.model_dir, "temporal_adapter.ckpt")
+        temporal_ckpt_path = osp.join(self.model_dir, "FoleyCrafter", "temporal_adapter.ckpt")
 
         # load vocoder
         vocoder_config_path = osp.join(self.model_dir, "auffusion")
         self.vocoder = Generator.from_pretrained(vocoder_config_path, subfolder="vocoder")
 
         # load time detector
-        time_detector_ckpt = osp.join(osp.join(self.model_dir, "timestamp_detector.pth.tar"))
+        time_detector_ckpt = osp.join(self.model_dir, "FoleyCrafter", "timestamp_detector.pth.tar")
         time_detector = VideoOnsetNet(False)
         self.time_detector, _ = torch_utils.load_model(time_detector_ckpt, time_detector, strict=True)
 
         self.pipeline = build_foleycrafter()
-        ckpt = torch.load(temporal_ckpt_path)
+        ckpt = torch.load(temporal_ckpt_path, map_location="cpu")
 
         # load temporal adapter
         if "state_dict" in ckpt.keys():
@@ -117,10 +118,12 @@ class FoleyController:
         )
 
         self.pipeline.load_ip_adapter(
-            fc_ckpt, subfolder="semantic", weight_name="semantic_adapter.bin", image_encoder_folder=None
+            osp.join(self.model_dir, "FoleyCrafter"),
+            subfolder="semantic",
+            weight_name="semantic_adapter.bin",
+            image_encoder_folder=None,
         )
 
-        gr.Info("Load Finish!")
         print("Load Finish!")
         self.loaded = True
 
@@ -173,6 +176,7 @@ class FoleyController:
             num_chunks = int(np.ceil(duration / chunk_duration))
 
             audio_outputs = []
+            video_clips = []
 
             for chunk_idx in range(num_chunks):
                 start_time = chunk_idx * chunk_duration
@@ -183,6 +187,9 @@ class FoleyController:
                 start_frame_idx = int(start_time * frames_per_second)
                 end_frame_idx = int(end_time * frames_per_second)
                 chunk_frames = frames[start_frame_idx:end_frame_idx]
+
+                if len(chunk_frames) == 0:
+                    continue  # Skip if no frames in this chunk
 
                 # Process time frames
                 time_frames = torch.FloatTensor(chunk_frames).permute(0, 3, 1, 2)
@@ -202,7 +209,8 @@ class FoleyController:
                 time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
 
                 # Process images for image embeddings
-                frames_to_process = chunk_frames[::10]
+                step = max(1, len(chunk_frames) // 10)
+                frames_to_process = chunk_frames[::step]
                 images = self.image_processor(images=frames_to_process, return_tensors="pt").to(device)
                 image_embeddings = self.image_encoder(**images).image_embeds
                 image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
@@ -234,12 +242,18 @@ class FoleyController:
                     audio = audio.detach().cpu().numpy()
                 audio_outputs.append(audio)
 
+                # Process video clip
+                video_clip = VideoFileClip(input_video).subclip(start_time, end_time)
+                video_clips.append(video_clip)
+
                 # Delete variables related to the chunk and free memory
-                del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio
+                del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio, video_clip
                 torch.cuda.empty_cache()
                 gc.collect()
 
             # Concatenate audio outputs
+            if len(audio_outputs) == 0:
+                return None  # Return if no audio outputs
             full_audio = np.concatenate(audio_outputs)
 
             # Adjust output directory and file names
@@ -258,19 +272,17 @@ class FoleyController:
 
             # Combine audio with video
             audio_clip = AudioFileClip(save_path)
-            video_clip = VideoFileClip(input_video)
-            audio_clip = audio_clip.subclip(0, duration)
-            video_clip.audio = audio_clip
-            video_clip = video_clip.subclip(0, duration)
+            final_video_clip = concatenate_videoclips(video_clips)
+            final_video_clip.audio = audio_clip
             output_video_path = osp.join(output_dir, f"{name}.mp4")
-            video_clip.write_videofile(output_video_path)
+            final_video_clip.write_videofile(output_video_path)
             save_sample_path = output_video_path
 
             # Move models back to CPU
-            self.time_detector.to('cpu')
-            self.pipeline.to('cpu')
-            self.vocoder.to('cpu')
-            self.image_encoder.to('cpu')
+            self.time_detector.to("cpu")
+            self.pipeline.to("cpu")
+            self.vocoder.to("cpu")
+            self.image_encoder.to("cpu")
 
             # Clear GPU memory and collect garbage
             torch.cuda.empty_cache()
@@ -352,10 +364,54 @@ with gr.Blocks(css=css) as demo:
 
         gr.Examples(
             examples=[
-                ["examples/gen3/case1.mp4", "bear talking to camera in childrens show", "", 1.0, 0.15, "DDIM", 45, 7.5, 12131415, True],
-                ["examples/gen3/case3.mp4", "fly swatter misses fly in slow motion", "", 1.0, 0.2, "DDIM", 45, 7.5, 45148336, True],
-                ["examples/gen3/case5.mp4", "lava eruption over volcano in a helicopter", "", 0.75, 0.2, "DDIM", 45, 7.5, 1984, True],
-                ["examples/gen3/case6.mp4", "stuffed puppet vocalises in childrens television show", "", 1.0, 0.3, "DDIM", 45, 7.5, 1337, True],
+                [
+                    "examples/gen3/case1.mp4",
+                    "bear talking to camera in childrens show",
+                    "",
+                    1.0,
+                    0.15,
+                    "DDIM",
+                    45,
+                    7.5,
+                    12131415,
+                    True,
+                ],
+                [
+                    "examples/gen3/case3.mp4",
+                    "fly swatter misses fly in slow motion",
+                    "",
+                    1.0,
+                    0.2,
+                    "DDIM",
+                    45,
+                    7.5,
+                    45148336,
+                    True,
+                ],
+                [
+                    "examples/gen3/case5.mp4",
+                    "lava eruption over volcano in a helicopter",
+                    "",
+                    0.75,
+                    0.2,
+                    "DDIM",
+                    45,
+                    7.5,
+                    1984,
+                    True,
+                ],
+                [
+                    "examples/gen3/case6.mp4",
+                    "stuffed puppet vocalises in childrens television show",
+                    "",
+                    1.0,
+                    0.3,
+                    "DDIM",
+                    45,
+                    7.5,
+                    1337,
+                    True,
+                ],
             ],
             inputs=[
                 init_img,
