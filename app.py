@@ -3,6 +3,7 @@ import os.path as osp
 import random
 from argparse import ArgumentParser
 from datetime import datetime
+import gc
 
 import gradio as gr
 import soundfile as sf
@@ -39,7 +40,7 @@ css = """
 
 parser = ArgumentParser()
 parser.add_argument("--config", type=str, default="example/config/base.yaml")
-parser.add_argument("--server-name", type=str, default="0.0.0.0")
+parser.add_argument("--server-name", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=7860)
 parser.add_argument("--share", type=bool, default=False)
 
@@ -136,81 +137,107 @@ class FoleyController:
         cfg_scale_slider,
         seed_textbox,
     ):
-        device = "cuda"
-        # move to gpu
-        self.time_detector = controller.time_detector.to(device)
-        self.pipeline = controller.pipeline.to(device)
-        self.vocoder = controller.vocoder.to(device)
-        self.image_encoder = controller.image_encoder.to(device)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        generator = torch.Generator(device=device)
+        if seed_textbox != "":
+            torch.manual_seed(int(seed_textbox))
+            generator.manual_seed(int(seed_textbox))
+
+        # Define the video transformation outside the with block
         vision_transform_list = [
             torchvision.transforms.Resize((128, 128)),
             torchvision.transforms.CenterCrop((112, 112)),
             torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
         video_transform = torchvision.transforms.Compose(vision_transform_list)
-        # if not self.loaded:
-        #     raise gr.Error("Error with loading model")
-        generator = torch.Generator()
-        if seed_textbox != "":
-            torch.manual_seed(int(seed_textbox))
-            generator.manual_seed(int(seed_textbox))
-        max_frame_nums = 150
-        frames, duration = read_frames_with_moviepy(input_video, max_frame_nums=max_frame_nums)
-        if duration >= 10:
-            duration = 10
-        time_frames = torch.FloatTensor(frames).permute(0, 3, 1, 2).to(device)
-        time_frames = video_transform(time_frames)
-        time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
-        preds = self.time_detector(time_frames)
-        preds = torch.sigmoid(preds)
 
-        # duration
-        time_condition = [
-            -1 if preds[0][int(i / (1024 / 10 * duration) * max_frame_nums)] < 0.5 else 1
-            for i in range(int(1024 / 10 * duration))
-        ]
-        time_condition = time_condition + [-1] * (1024 - len(time_condition))
-        # w -> b c h w
-        time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(1, 1, 256, 1)
+        with torch.no_grad():
+            # Move models to GPU
+            self.time_detector = self.time_detector.to(device)
+            self.pipeline = self.pipeline.to(device)
+            self.vocoder = self.vocoder.to(device)
+            self.image_encoder = self.image_encoder.to(device)
 
-        # Note that clip need fewer frames
-        frames = frames[::10]
-        images = self.image_processor(images=frames, return_tensors="pt").to(device)
-        image_embeddings = self.image_encoder(**images).image_embeds
-        image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
-        neg_image_embeddings = torch.zeros_like(image_embeddings)
-        image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1)
-        self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
-        sample = self.pipeline(
-            prompt=prompt_textbox,
-            negative_prompt=negative_prompt_textbox,
-            ip_adapter_image_embeds=image_embeddings,
-            image=time_condition,
-            controlnet_conditioning_scale=float(temporal_scale),
-            num_inference_steps=sample_step_slider,
-            height=256,
-            width=1024,
-            output_type="pt",
-            generator=generator,
-        )
-        name = "output"
-        audio_img = sample.images[0]
-        audio = denormalize_spectrogram(audio_img)
-        audio = self.vocoder.inference(audio, lengths=160000)[0]
-        audio_save_path = osp.join(self.savedir_sample, "audio")
-        os.makedirs(audio_save_path, exist_ok=True)
-        audio = audio[: int(duration * 16000)]
+            # Process video frames
+            max_frame_nums = 150
+            frames, duration = read_frames_with_moviepy(input_video, max_frame_nums=max_frame_nums)
+            duration = min(duration, 10)
 
-        save_path = osp.join(audio_save_path, f"{name}.wav")
-        sf.write(save_path, audio, 16000)
+            # Process time frames
+            time_frames = torch.FloatTensor(frames).permute(0, 3, 1, 2)
+            time_frames = video_transform(time_frames)
+            time_frames = time_frames.to(device)
+            time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
+            preds = self.time_detector(time_frames)
+            preds = torch.sigmoid(preds)
 
-        audio = AudioFileClip(osp.join(audio_save_path, f"{name}.wav"))
-        video = VideoFileClip(input_video)
-        audio = audio.subclip(0, duration)
-        video.audio = audio
-        video = video.subclip(0, duration)
-        video.write_videofile(osp.join(self.savedir_sample, f"{name}.mp4"))
-        save_sample_path = os.path.join(self.savedir_sample, f"{name}.mp4")
+            # Prepare time condition
+            num_audio_frames = int(1024 / 10 * duration)
+            time_condition = [
+                -1 if preds[0][int(i / num_audio_frames * max_frame_nums)] < 0.5 else 1
+                for i in range(num_audio_frames)
+            ]
+            time_condition += [-1] * (1024 - len(time_condition))
+            time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
+
+            # Process images for image embeddings
+            frames = frames[::10]
+            images = self.image_processor(images=frames, return_tensors="pt").to(device)
+            image_embeddings = self.image_encoder(**images).image_embeds
+            image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
+            neg_image_embeddings = torch.zeros_like(image_embeddings)
+            image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
+
+            # Set scales and run pipeline
+            self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
+            sample = self.pipeline(
+                prompt=prompt_textbox,
+                negative_prompt=negative_prompt_textbox,
+                ip_adapter_image_embeds=image_embeddings,
+                image=time_condition,
+                controlnet_conditioning_scale=float(temporal_scale),
+                num_inference_steps=sample_step_slider,
+                height=256,
+                width=1024,
+                output_type="pt",
+                generator=generator,
+            )
+
+            # Process output
+            name = "output"
+            audio_img = sample.images[0]
+            audio = denormalize_spectrogram(audio_img)
+            audio = self.vocoder.inference(audio, lengths=160000)[0]
+            audio = audio[: int(duration * 16000)]
+            # Ensure audio is a NumPy array on CPU
+            if isinstance(audio, torch.Tensor):
+                audio = audio.detach().cpu().numpy()
+            audio_save_path = osp.join(self.savedir_sample, "audio")
+            os.makedirs(audio_save_path, exist_ok=True)
+            save_path = osp.join(audio_save_path, f"{name}.wav")
+            sf.write(save_path, audio, 16000)
+
+            # Combine audio with video
+            audio_clip = AudioFileClip(save_path)
+            video_clip = VideoFileClip(input_video)
+            audio_clip = audio_clip.subclip(0, duration)
+            video_clip.audio = audio_clip
+            video_clip = video_clip.subclip(0, duration)
+            output_video_path = osp.join(self.savedir_sample, f"{name}.mp4")
+            video_clip.write_videofile(output_video_path)
+            save_sample_path = output_video_path
+
+            # Delete variables and move models back to CPU
+            del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio
+            self.time_detector.to('cpu')
+            self.pipeline.to('cpu')
+            self.vocoder.to('cpu')
+            self.image_encoder.to('cpu')
+
+            # Clear GPU memory and collect garbage
+            torch.cuda.empty_cache()
+            gc.collect()
 
         return save_sample_path
 
@@ -223,27 +250,11 @@ with gr.Blocks(css=css) as demo:
         '<h1 style="height: 136px; display: flex; align-items: center; justify-content: space-around;"><span style="height: 100%; width:136px;"><img src="file/assets/foleycrafter.png" alt="logo" style="height: 100%; width:auto; object-fit: contain; margin: 0px 0px; padding: 0px 0px;"></span><strong style="font-size: 36px;">FoleyCrafter: Bring Silent Videos to Life with Lifelike and Synchronized Sounds</strong></h1>'
     )
     gr.HTML(
-        '<p id="authors" style="text-align:center; font-size:24px;"> \
-        <a href="https://github.com/ymzhang0319">Yiming Zhang</a><sup>1</sup>,&nbsp \
-        <a href="https://github.com/VocodexElysium">Yicheng Gu</a><sup>2</sup>,&nbsp \
-        <a href="https://zengyh1900.github.io/">Yanhong Zeng</a><sup>1 †</sup>,&nbsp \
-        <a href="https://github.com/LeoXing1996/">Zhening Xing</a><sup>1</sup>,&nbsp \
-        <a href="https://github.com/HeCheng0625">Yuancheng Wang</a><sup>2</sup>,&nbsp \
-        <a href="https://drwuz.com/">Zhizheng Wu</a><sup>2</sup>,&nbsp \
-        <a href="https://chenkai.site/">Kai Chen</a><sup>1 †</sup>\
-        <br>\
-        <span>\
-            <sup>1</sup>Shanghai AI Laboratory &nbsp;&nbsp;&nbsp;\
-            <sup>2</sup>Chinese University of Hong Kong, Shenzhen &nbsp;&nbsp;&nbsp;\
-            †Corresponding author\
-        </span>\
-    </p>'
+        '<p id="authors" style="text-align:center; font-size:24px;">  </p>'
     )
     with gr.Row():
         gr.Markdown(
-            "<div align='center'><font size='5'><a href='https://foleycrafter.github.io/'>Project Page</a> &ensp;"  # noqa
-            "<a href='https://arxiv.org/abs/2407.01494/'>Paper</a> &ensp;"
-            "<a href='https://github.com/open-mmlab/foleycrafter'>Code</a> &ensp;"
+            "<div align='center'><font size='5'>"
             "<a href='https://huggingface.co/spaces/ymzhang319/FoleyCrafter'>Demo</a> </font></div>"
         )
 
@@ -274,7 +285,7 @@ with gr.Blocks(css=css) as demo:
                     cfg_scale_slider = gr.Slider(label="CFG Scale", value=7.5, minimum=0, maximum=20)
 
                 with gr.Row():
-                    seed_textbox = gr.Textbox(label="Seed", value=42)
+                    seed_textbox = gr.Textbox(label="Seed", value=1337)
                     seed_button = gr.Button(value="\U0001f3b2", elem_classes="toolbutton")
                 seed_button.click(fn=lambda x: random.randint(1, 1e8), outputs=[seed_textbox], queue=False)
 
@@ -308,10 +319,10 @@ with gr.Blocks(css=css) as demo:
 
         gr.Examples(
             examples=[
-                ["examples/gen3/case1.mp4", "", "", 1.0, 0.2, "DDIM", 25, 7.5, 33817921],
-                ["examples/gen3/case3.mp4", "", "", 1.0, 0.2, "DDIM", 25, 7.5, 94667578],
-                ["examples/gen3/case5.mp4", "", "", 0.75, 0.2, "DDIM", 25, 7.5, 92890876],
-                ["examples/gen3/case6.mp4", "", "", 1.0, 0.2, "DDIM", 25, 7.5, 77015909],
+                ["examples/gen3/case1.mp4", "bear talking to camera in childrens show", "", 1.0, 0.2, "DDIM", 25, 7.5, 33817921],
+                ["examples/gen3/case3.mp4", "fly swatter misses fly in slow motion", "", 1.0, 0.2, "DDIM", 25, 7.5, 94667578],
+                ["examples/gen3/case5.mp4", "lava eruption over volcano in a helicopter", "", 0.75, 0.2, "DDIM", 25, 7.5, 92890876],
+                ["examples/gen3/case6.mp4", "stuffed puppet vocalises in childrens television show", "", 1.0, 0.2, "DDIM", 25, 7.5, 77015909],
             ],
             inputs=[
                 init_img,
