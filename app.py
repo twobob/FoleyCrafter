@@ -4,6 +4,7 @@ import random
 from argparse import ArgumentParser
 from datetime import datetime
 import gc
+import numpy as np
 
 import gradio as gr
 import soundfile as sf
@@ -60,7 +61,7 @@ class FoleyController:
         self.model_dir = os.path.join(self.basedir, args.ckpt)
         self.savedir = os.path.join(self.basedir, args.save_path, datetime.now().strftime("Gradio-%Y-%m-%dT%H-%M-%S"))
         self.savedir_sample = os.path.join(self.savedir, "sample")
-        os.makedirs(self.savedir, exist_ok=True)
+        os.makedirs(self.savedir_sample, exist_ok=True)
 
         self.pipeline = None
 
@@ -136,6 +137,7 @@ class FoleyController:
         sample_step_slider,
         cfg_scale_slider,
         seed_textbox,
+        overwrite_checkbox,
     ):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         generator = torch.Generator(device=device)
@@ -159,64 +161,100 @@ class FoleyController:
             self.image_encoder = self.image_encoder.to(device)
 
             # Process video frames
-            max_frame_nums = 150
-            frames, duration = read_frames_with_moviepy(input_video, max_frame_nums=max_frame_nums)
-            duration = min(duration, 10)
+            frames, duration = read_frames_with_moviepy(input_video)
+            max_duration = 60  # Maximum duration
+            duration = min(duration, max_duration)
 
-            # Process time frames
-            time_frames = torch.FloatTensor(frames).permute(0, 3, 1, 2)
-            time_frames = video_transform(time_frames)
-            time_frames = time_frames.to(device)
-            time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
-            preds = self.time_detector(time_frames)
-            preds = torch.sigmoid(preds)
+            total_frames = len(frames)
+            frames_per_second = total_frames / duration
 
-            # Prepare time condition
-            num_audio_frames = int(1024 / 10 * duration)
-            time_condition = [
-                -1 if preds[0][int(i / num_audio_frames * max_frame_nums)] < 0.5 else 1
-                for i in range(num_audio_frames)
-            ]
-            time_condition += [-1] * (1024 - len(time_condition))
-            time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
+            # Calculate number of chunks
+            chunk_duration = 10  # Duration per chunk
+            num_chunks = int(np.ceil(duration / chunk_duration))
 
-            # Process images for image embeddings
-            frames = frames[::10]
-            images = self.image_processor(images=frames, return_tensors="pt").to(device)
-            image_embeddings = self.image_encoder(**images).image_embeds
-            image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
-            neg_image_embeddings = torch.zeros_like(image_embeddings)
-            image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
+            audio_outputs = []
 
-            # Set scales and run pipeline
-            self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
-            sample = self.pipeline(
-                prompt=prompt_textbox,
-                negative_prompt=negative_prompt_textbox,
-                ip_adapter_image_embeds=image_embeddings,
-                image=time_condition,
-                controlnet_conditioning_scale=float(temporal_scale),
-                num_inference_steps=sample_step_slider,
-                height=256,
-                width=1024,
-                output_type="pt",
-                generator=generator,
-            )
+            for chunk_idx in range(num_chunks):
+                start_time = chunk_idx * chunk_duration
+                end_time = min((chunk_idx + 1) * chunk_duration, duration)
+                chunk_duration_actual = end_time - start_time
 
-            # Process output
-            name = "output"
-            audio_img = sample.images[0]
-            audio = denormalize_spectrogram(audio_img)
-            audio = self.vocoder.inference(audio, lengths=160000)[0]
-            audio = audio[: int(duration * 16000)]
-            # Ensure audio is a NumPy array on CPU
-            if isinstance(audio, torch.Tensor):
-                audio = audio.detach().cpu().numpy()
-            audio_save_path = osp.join(self.savedir_sample, "audio")
+                # Get frame indices for this chunk
+                start_frame_idx = int(start_time * frames_per_second)
+                end_frame_idx = int(end_time * frames_per_second)
+                chunk_frames = frames[start_frame_idx:end_frame_idx]
+
+                # Process time frames
+                time_frames = torch.FloatTensor(chunk_frames).permute(0, 3, 1, 2)
+                time_frames = video_transform(time_frames)
+                time_frames = time_frames.to(device)
+                time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
+                preds = self.time_detector(time_frames)
+                preds = torch.sigmoid(preds)
+
+                # Prepare time condition
+                num_audio_frames = 1024
+                time_condition = [
+                    -1 if preds[0][int(i / num_audio_frames * len(chunk_frames))] < 0.5 else 1
+                    for i in range(num_audio_frames)
+                ]
+                time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
+
+                # Process images for image embeddings
+                frames_to_process = chunk_frames[::10]
+                images = self.image_processor(images=frames_to_process, return_tensors="pt").to(device)
+                image_embeddings = self.image_encoder(**images).image_embeds
+                image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
+                neg_image_embeddings = torch.zeros_like(image_embeddings)
+                image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
+
+                # Set scales and run pipeline
+                self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
+                sample = self.pipeline(
+                    prompt=prompt_textbox,
+                    negative_prompt=negative_prompt_textbox,
+                    ip_adapter_image_embeds=image_embeddings,
+                    image=time_condition,
+                    controlnet_conditioning_scale=float(temporal_scale),
+                    num_inference_steps=sample_step_slider,
+                    height=256,
+                    width=1024,
+                    output_type="pt",
+                    generator=generator,
+                )
+
+                # Process output
+                audio_img = sample.images[0]
+                audio = denormalize_spectrogram(audio_img)
+                audio = self.vocoder.inference(audio, lengths=160000)[0]
+                audio = audio[: int(chunk_duration_actual * 16000)]
+                # Ensure audio is a NumPy array on CPU
+                if isinstance(audio, torch.Tensor):
+                    audio = audio.detach().cpu().numpy()
+                audio_outputs.append(audio)
+
+                # Delete variables related to the chunk and free memory
+                del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio
+                torch.cuda.empty_cache()
+                gc.collect()
+
+            # Concatenate audio outputs
+            full_audio = np.concatenate(audio_outputs)
+
+            # Adjust output directory and file names
+            if overwrite_checkbox:
+                name = "output"
+                output_dir = self.savedir_sample
+            else:
+                name = datetime.now().strftime("%Y%m%d%H%M%S")
+                output_dir = os.path.join(self.savedir_sample, name)
+                os.makedirs(output_dir, exist_ok=True)
+
+            audio_save_path = osp.join(output_dir, "audio")
             os.makedirs(audio_save_path, exist_ok=True)
             save_path = osp.join(audio_save_path, f"{name}.wav")
-            sf.write(save_path, audio, 16000)
+            sf.write(save_path, full_audio, 16000)
 
             # Combine audio with video
             audio_clip = AudioFileClip(save_path)
@@ -224,12 +262,11 @@ class FoleyController:
             audio_clip = audio_clip.subclip(0, duration)
             video_clip.audio = audio_clip
             video_clip = video_clip.subclip(0, duration)
-            output_video_path = osp.join(self.savedir_sample, f"{name}.mp4")
+            output_video_path = osp.join(output_dir, f"{name}.mp4")
             video_clip.write_videofile(output_video_path)
             save_sample_path = output_video_path
 
-            # Delete variables and move models back to CPU
-            del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio
+            # Move models back to CPU
             self.time_detector.to('cpu')
             self.pipeline.to('cpu')
             self.vocoder.to('cpu')
@@ -247,16 +284,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 with gr.Blocks(css=css) as demo:
     gr.HTML(
-        '<h1 style="height: 136px; display: flex; align-items: center; justify-content: space-around;"><span style="height: 100%; width:136px;"><img src="file/assets/foleycrafter.png" alt="logo" style="height: 100%; width:auto; object-fit: contain; margin: 0px 0px; padding: 0px 0px;"></span><strong style="font-size: 36px;">FoleyCrafter: Bring Silent Videos to Life with Lifelike and Synchronized Sounds</strong></h1>'
+        '<h1 style="height: 136px; display: flex; align-items: center; justify-content: space-around;"><span style="height: 100%; width:136px;"><img src="./assets/foleycrafter.png" alt="logo" style="height: 100%; width:auto; object-fit: contain; margin: 0px 0px; padding: 0px 0px;"></span><strong style="font-size: 36px;">FoleyCrafter: Bring Silent Videos to Life with Lifelike and Synchronized Sounds</strong></h1>'
     )
-    gr.HTML(
-        '<p id="authors" style="text-align:center; font-size:24px;">  </p>'
-    )
-    with gr.Row():
-        gr.Markdown(
-            "<div align='center'><font size='5'>"
-            "<a href='https://huggingface.co/spaces/ymzhang319/FoleyCrafter'>Demo</a> </font></div>"
-        )
 
     with gr.Column(variant="panel"):
         with gr.Row(equal_height=False):
@@ -289,6 +318,9 @@ with gr.Blocks(css=css) as demo:
                     seed_button = gr.Button(value="\U0001f3b2", elem_classes="toolbutton")
                 seed_button.click(fn=lambda x: random.randint(1, 1e8), outputs=[seed_textbox], queue=False)
 
+                with gr.Row():
+                    overwrite_checkbox = gr.Checkbox(label="Overwrite existing outputs", value=True)
+
                 generate_button = gr.Button(value="Generate", variant="primary")
 
             with gr.Column():
@@ -313,16 +345,17 @@ with gr.Blocks(css=css) as demo:
                 sample_step_slider,
                 cfg_scale_slider,
                 seed_textbox,
+                overwrite_checkbox,
             ],
             outputs=[result_video],
         )
 
         gr.Examples(
             examples=[
-                ["examples/gen3/case1.mp4", "bear talking to camera in childrens show", "", 1.0, 0.2, "DDIM", 25, 7.5, 33817921],
-                ["examples/gen3/case3.mp4", "fly swatter misses fly in slow motion", "", 1.0, 0.2, "DDIM", 25, 7.5, 94667578],
-                ["examples/gen3/case5.mp4", "lava eruption over volcano in a helicopter", "", 0.75, 0.2, "DDIM", 25, 7.5, 92890876],
-                ["examples/gen3/case6.mp4", "stuffed puppet vocalises in childrens television show", "", 1.0, 0.2, "DDIM", 25, 7.5, 77015909],
+                ["examples/gen3/case1.mp4", "bear talking to camera in childrens show", "", 1.0, 0.15, "DDIM", 45, 7.5, 12131415, True],
+                ["examples/gen3/case3.mp4", "fly swatter misses fly in slow motion", "", 1.0, 0.2, "DDIM", 45, 7.5, 45148336, True],
+                ["examples/gen3/case5.mp4", "lava eruption over volcano in a helicopter", "", 0.75, 0.2, "DDIM", 45, 7.5, 1984, True],
+                ["examples/gen3/case6.mp4", "stuffed puppet vocalises in childrens television show", "", 1.0, 0.3, "DDIM", 45, 7.5, 1337, True],
             ],
             inputs=[
                 init_img,
@@ -334,6 +367,7 @@ with gr.Blocks(css=css) as demo:
                 sample_step_slider,
                 cfg_scale_slider,
                 seed_textbox,
+                overwrite_checkbox,
             ],
             cache_examples=True,
             outputs=[result_video],
