@@ -18,8 +18,7 @@ from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
 from foleycrafter.models.onset import torch_utils
 from foleycrafter.models.time_detector.model import VideoOnsetNet
 from foleycrafter.pipelines.auffusion_pipeline import Generator, denormalize_spectrogram
-from foleycrafter.utils.util import build_foleycrafter, read_frames_with_moviepy
-
+from foleycrafter.utils.util import build_foleycrafter
 
 os.environ["GRADIO_TEMP_DIR"] = "./tmp"
 
@@ -129,6 +128,19 @@ class FoleyController:
 
         return "Load"
 
+    def read_frames_with_moviepy(self, video_path, max_frame_nums=None):
+        from moviepy.editor import VideoFileClip
+        frames = []
+        video = VideoFileClip(video_path)
+        duration = video.duration
+        for frame in video.iter_frames():
+            frames.append(frame)
+        frames = np.array(frames)
+        if max_frame_nums is not None:
+            frames_idx = np.linspace(0, len(frames)-1, max_frame_nums, dtype=int)
+            frames = frames[frames_idx, ...]
+        return frames, duration
+
     def foley(
         self,
         input_video,
@@ -164,8 +176,8 @@ class FoleyController:
             self.image_encoder = self.image_encoder.to(device)
 
             # Process video frames
-            frames, duration = read_frames_with_moviepy(input_video)
-            max_duration = 60  # Maximum duration
+            frames, duration = self.read_frames_with_moviepy(input_video)
+            max_duration = 180  # Maximum duration set to 3 minutes
             duration = min(duration, max_duration)
 
             total_frames = len(frames)
@@ -177,6 +189,8 @@ class FoleyController:
 
             audio_outputs = []
             video_clips = []
+
+            prev_latents = None  # Initialize previous latents
 
             for chunk_idx in range(num_chunks):
                 start_time = chunk_idx * chunk_duration
@@ -219,6 +233,19 @@ class FoleyController:
 
                 # Set scales and run pipeline
                 self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
+                self.pipeline.scheduler = scheduler_dict[sampler_dropdown].from_config(self.pipeline.scheduler.config)
+                self.pipeline.scheduler.config.steps_offset = 1
+                self.pipeline.scheduler.set_timesteps(sample_step_slider)
+
+                # Prepare latents
+                height = 256
+                width = 1024
+                latents_shape = (1, self.pipeline.unet.in_channels, height // 8, width // 8)
+                if prev_latents is None:
+                    latents = torch.randn(latents_shape, generator=generator, device=device)
+                else:
+                    latents = prev_latents
+
                 sample = self.pipeline(
                     prompt=prompt_textbox,
                     negative_prompt=negative_prompt_textbox,
@@ -226,11 +253,17 @@ class FoleyController:
                     image=time_condition,
                     controlnet_conditioning_scale=float(temporal_scale),
                     num_inference_steps=sample_step_slider,
-                    height=256,
-                    width=1024,
+                    height=height,
+                    width=width,
                     output_type="pt",
                     generator=generator,
+                    latents=latents,
+                    guidance_scale=cfg_scale_slider,
+                    return_dict=True,
                 )
+
+                # Update the latents for the next iteration
+                prev_latents = latents
 
                 # Process output
                 audio_img = sample.images[0]
