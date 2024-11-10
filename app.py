@@ -29,6 +29,7 @@ from foleycrafter.utils.util import build_foleycrafter
 # Additional imports for idefics2-8b
 from transformers import AutoProcessor, AutoModelForVision2Seq
 from PIL import Image
+import shutil  # Import shutil for file operations
 
 os.environ["GRADIO_TEMP_DIR"] = "./tmp"
 
@@ -212,35 +213,37 @@ class FoleyController:
                 "Silent film",
                 "Nothing.",
             ]
-            
+
             # Convert to lower case for case-insensitive replacement
             text_lower = text.lower()
-            
+
             # Remove each phrase and any extra spaces
             for phrase in phrases_to_remove:
                 text_lower = text_lower.replace(phrase, "")
-            
+
             # Clean up any multiple spaces and trim
             cleaned_text = " ".join(text_lower.split())
-            
+
             # Capitalize first letter
             if cleaned_text:
                 cleaned_text = cleaned_text[0].upper() + cleaned_text[1:]
-            
+
             return cleaned_text
 
         def generate_response(prompt_text, current_images):
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }]
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }
+            ]
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
             inputs = self.processor(text=prompt, images=current_images, return_tensors="pt")
             inputs = {k: v.to(self.vision_device) for k, v in inputs.items()}
-            
+
             with torch.no_grad():
                 generated_ids = self.vision_model.generate(
                     **inputs,
@@ -253,7 +256,7 @@ class FoleyController:
                     top_p=0.9,
                     num_beams=1,
                 )
-            
+
             generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             for line in generated_text.strip().split("\n"):
                 if line.startswith("Assistant:"):
@@ -263,33 +266,46 @@ class FoleyController:
 
         for idx, image in enumerate(images):
             images_list = [image]
-            
+
             # Initial prompt for sound description - removed image references
-            initial_prompt = ("Describe briefly (under 10 words) the actions causing noises, "
-                            "Focus on sound, No Visual descriptions") if idx == 0 else "What would we hear?"
-            
+            initial_prompt = (
+                "Describe briefly (under 10 words) the actions causing noises, "
+                "Focus on sound, No Visual descriptions"
+            ) if idx == 0 else "What would we hear?"
+
             response = generate_response(initial_prompt, images_list)
-            
+
             # If response indicates no sound or is empty, try ambient sound prompt
-            if response.lower() in ["nothing", "there is no sound", ""]:
-                ambient_prompt = ("Describe what ambient sounds would be present in this location "
-                                "(wind, echoes, distant traffic, etc)")
+            if response.lower() in [
+                "nothing",
+                "there is no sound",
+                "",
+                "answering does not require reading text",
+                "unknown",
+                "I can't describe a picture that shows sound.",
+                "I can't describe sound but i can describe visual.",
+                "I can't describe it in words.",
+            ]:
+                ambient_prompt = (
+                    "Describe what ambient sounds would be present in this location "
+                    "(wind, echoes, distant traffic, etc)"
+                )
                 response = generate_response(ambient_prompt, images_list)
-            
+
             # Limit response to 25 words
             response = " ".join(response.split()[:25])
-            
+
             # Only add if it's a unique response
             if response.lower() not in seen_responses:
                 seen_responses.add(response.lower())
                 assistant_replies.append(response)
-            
+
             if len(assistant_replies) >= 5:
                 break
 
         # Combine responses into final prompt
         generated_prompt = " ".join(assistant_replies)
-        
+
         # Combine with user prompt if provided
         combined_prompt = f"{user_prompt} {generated_prompt}" if user_prompt else generated_prompt
 
@@ -298,7 +314,7 @@ class FoleyController:
         if len(tokens) > 77:
             user_prompt_tokens = self.clip_tokenizer.tokenize(user_prompt) if user_prompt else []
             max_generated_tokens = 77 - len(user_prompt_tokens)
-            
+
             if max_generated_tokens <= 0:
                 combined_prompt = self.clip_tokenizer.convert_tokens_to_string(user_prompt_tokens[:77])
             else:
@@ -306,9 +322,11 @@ class FoleyController:
                 truncated_generated_prompt = self.clip_tokenizer.convert_tokens_to_string(
                     generated_prompt_tokens[:max_generated_tokens]
                 )
-                combined_prompt = f"{user_prompt} {truncated_generated_prompt}" if user_prompt else truncated_generated_prompt
+                combined_prompt = (
+                    f"{user_prompt} {truncated_generated_prompt}" if user_prompt else truncated_generated_prompt
+                )
 
-        print('\n', combined_prompt)
+        print("\n", combined_prompt)
         return combined_prompt.strip()
 
     def foley(
@@ -332,13 +350,28 @@ class FoleyController:
             torch.manual_seed(int(seed_textbox))
             generator.manual_seed(int(seed_textbox))
 
-        # Define the video transformation outside the with block
         vision_transform_list = [
             torchvision.transforms.Resize((128, 128)),
             torchvision.transforms.CenterCrop((112, 112)),
             torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
         video_transform = torchvision.transforms.Compose(vision_transform_list)
+
+        # Extract the video path from the input_video
+        if isinstance(input_video, dict):
+            temp_video_path = input_video["name"]
+        else:
+            temp_video_path = input_video
+
+        # Save the uploaded video to a persistent location
+        # Define a path to save the video
+        saved_video_dir = os.path.join(self.savedir_sample, "input_videos")
+        os.makedirs(saved_video_dir, exist_ok=True)
+        video_filename = os.path.basename(temp_video_path)
+        video_path = os.path.join(saved_video_dir, video_filename)
+
+        # Copy the video from the temporary path to the persistent location
+        shutil.copy(temp_video_path, video_path)
 
         with torch.no_grad():
             # Move models to GPU when needed
@@ -348,7 +381,7 @@ class FoleyController:
             self.image_encoder = self.image_encoder.to(device)
 
             # Process video frames
-            frames, duration = self.read_frames_with_moviepy(input_video)
+            frames, duration = self.read_frames_with_moviepy(video_path)
             max_duration = 600  # Maximum duration set to 5 minutes
             duration = min(duration, max_duration)
 
@@ -361,10 +394,12 @@ class FoleyController:
 
             audio_outputs = []
             video_clips = []
-            prev_latents = None  # Initialize previous latents
+            prev_latents = None
 
-            # Initialize tqdm progress bar
             progress_bar = tqdm(total=num_chunks, desc="Processing video chunks", unit="chunk")
+
+            # Set up padding calculation based on actual frame count needed per chunk
+            target_frame_count = int(chunk_duration * frames_per_second)  # Required frames per chunk
 
             try:
                 for chunk_idx in range(num_chunks):
@@ -377,12 +412,23 @@ class FoleyController:
                     end_frame_idx = int(end_time * frames_per_second)
                     chunk_frames = frames[start_frame_idx:end_frame_idx]
 
-                    if len(chunk_frames) == 0:
-                        progress_bar.update(1)
-                        continue  # Skip if no frames in this chunk
+                    # Calculate padding for the final chunk
+                    if chunk_idx == num_chunks - 1 and len(chunk_frames) < target_frame_count:
+                        padding_needed = target_frame_count - len(chunk_frames)
+                        print(
+                            f"Padding final chunk with {padding_needed} blank frames to reach {target_frame_count} frames."
+                        )
+                        if len(chunk_frames) > 0:
+                            height, width, channels = chunk_frames[0].shape
+                        else:
+                            # Default dimensions if no frames are available
+                            height, width, channels = 256, 256, 3
+                        blank_frame = np.zeros((height, width, channels), dtype=frames.dtype)
+                        chunk_frames = np.concatenate([chunk_frames, [blank_frame] * padding_needed], axis=0)
 
+                    # Set `combined_prompt` based on the user option
                     if use_vision_model_checkbox:
-                        frame_interval = int(2 * frames_per_second)
+                        frame_interval = max(1, int(2 * frames_per_second))
                         idefics_frames = chunk_frames[::frame_interval]
                         idefics_images = [Image.fromarray(frame) for frame in idefics_frames]
                         combined_prompt = self.generate_prompt_from_images(
@@ -391,21 +437,34 @@ class FoleyController:
                     else:
                         combined_prompt = prompt_textbox.strip()
 
-                    # Process time frames
+                    # Ensure time_frames has shape (1, 3, num_frames, 112, 112)
                     time_frames = torch.FloatTensor(chunk_frames).permute(0, 3, 1, 2)
-                    time_frames = video_transform(time_frames)
-                    time_frames = time_frames.to(device)
-                    time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
-                    preds = self.time_detector(time_frames)
-                    preds = torch.sigmoid(preds)
+                    time_frames = video_transform(time_frames).to(device)
+                    time_frames = time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)
 
-                    # Prepare time condition
-                    num_audio_frames = 1024
-                    time_condition = [
-                        -1 if preds[0][int(i / num_audio_frames * len(chunk_frames))] < 0.5 else 1
-                        for i in range(num_audio_frames)
-                    ]
-                    time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                    # Run time detector with error handling for specific shape issues
+                    try:
+                        inputs = {"frames": time_frames}
+                        preds = self.time_detector(inputs)
+                        preds = torch.sigmoid(preds)
+
+                        # Prepare time condition based on preds
+                        num_audio_frames = 1024
+                        time_condition = [
+                            -1
+                            if preds[0, int(i / num_audio_frames * len(chunk_frames))].item() < 0.5
+                            else 1
+                            for i in range(num_audio_frames)
+                        ]
+
+                    except Exception as e:
+                        print(f"Warning: Time detector failed with error {str(e)}. Using default values.")
+                        time_condition = [0] * 1024
+
+                    # Convert time_condition to tensor
+                    time_condition = (
+                        torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                    )
                     time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
 
                     # Process images for image embeddings
@@ -413,11 +472,13 @@ class FoleyController:
                     frames_to_process = chunk_frames[::step]
                     images = self.image_processor(images=frames_to_process, return_tensors="pt").to(device)
                     image_embeddings = self.image_encoder(**images).image_embeds
-                    image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
+                    image_embeddings = (
+                        torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
+                    )
                     neg_image_embeddings = torch.zeros_like(image_embeddings)
                     image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
 
-                    # Set scales and run pipeline
+                    # Set scales and configure pipeline
                     self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
                     self.pipeline.scheduler = scheduler_dict[sampler_dropdown].from_config(
                         self.pipeline.scheduler.config
@@ -429,11 +490,13 @@ class FoleyController:
                     height = 256
                     width = 1024
                     latents_shape = (1, self.pipeline.unet.in_channels, height // 8, width // 8)
-                    if prev_latents is None:
-                        latents = torch.randn(latents_shape, generator=generator, device=device)
-                    else:
-                        latents = prev_latents
+                    latents = (
+                        torch.randn(latents_shape, generator=generator, device=device)
+                        if prev_latents is None
+                        else prev_latents
+                    )
 
+                    # Run the pipeline
                     sample = self.pipeline(
                         prompt=combined_prompt,
                         negative_prompt=negative_prompt_textbox,
@@ -450,7 +513,6 @@ class FoleyController:
                         return_dict=True,
                     )
 
-                    # Update the latents for the next iteration
                     prev_latents = latents
 
                     # Process output
@@ -463,48 +525,58 @@ class FoleyController:
                     audio_outputs.append(audio)
 
                     # Process video clip
-                    video_clip = VideoFileClip(input_video).subclip(start_time, end_time)
+                    video_clip = VideoFileClip(video_path).subclip(start_time, end_time)
                     video_clips.append(video_clip)
 
                     # Free up memory
-                    del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio, video_clip
+                    del (
+                        time_frames,
+                        images,
+                        image_embeddings,
+                        time_condition,
+                        sample,
+                        audio_img,
+                        audio,
+                        video_clip,
+                    )
                     torch.cuda.empty_cache()
                     gc.collect()
 
-                    # Update progress bar
                     progress_bar.update(1)
                     progress_bar.set_postfix({"Chunk": f"{chunk_idx + 1}/{num_chunks}"})
 
             finally:
-                # Close progress bar
                 progress_bar.close()
 
-            # Concatenate audio outputs
-            if len(audio_outputs) == 0:
-                return None
-            full_audio = np.concatenate(audio_outputs)
+                # Save processed chunks if any are available
+                if len(audio_outputs) > 0 and len(video_clips) > 0:
+                    # Combine audio outputs
+                    full_audio = np.concatenate(audio_outputs)
 
-            # Adjust output directory and file names
-            if overwrite_checkbox:
-                name = "output"
-                output_dir = self.savedir_sample
-            else:
-                name = datetime.now().strftime("%Y%m%d%H%M%S")
-                output_dir = os.path.join(self.savedir_sample, name)
-                os.makedirs(output_dir, exist_ok=True)
+                    # Set output directory
+                    if overwrite_checkbox:
+                        name = "output"
+                        output_dir = self.savedir_sample
+                    else:
+                        name = datetime.now().strftime("%Y%m%d%H%M%S")
+                        output_dir = os.path.join(self.savedir_sample, name)
+                        os.makedirs(output_dir, exist_ok=True)
 
-            audio_save_path = osp.join(output_dir, "audio")
-            os.makedirs(audio_save_path, exist_ok=True)
-            save_path = osp.join(audio_save_path, f"{name}.wav")
-            sf.write(save_path, full_audio, 16000)
+                    # Save audio
+                    audio_save_path = osp.join(output_dir, "audio")
+                    os.makedirs(audio_save_path, exist_ok=True)
+                    save_path = osp.join(audio_save_path, f"{name}.wav")
+                    sf.write(save_path, full_audio, 16000)
 
-            # Combine audio with video
-            audio_clip = AudioFileClip(save_path)
-            final_video_clip = concatenate_videoclips(video_clips)
-            final_video_clip.audio = audio_clip
-            output_video_path = osp.join(output_dir, f"{name}.mp4")
-            final_video_clip.write_videofile(output_video_path)
-            save_sample_path = output_video_path
+                    # Save video with combined audio
+                    audio_clip = AudioFileClip(save_path)
+                    final_video_clip = concatenate_videoclips(video_clips)
+                    final_video_clip.audio = audio_clip
+                    output_video_path = osp.join(output_dir, f"{name}.mp4")
+                    final_video_clip.write_videofile(output_video_path)
+                    save_sample_path = output_video_path
+
+                    print(f"Saved partially processed video to {save_sample_path}")
 
             # Move models back to CPU
             self.time_detector.to("cpu")
@@ -562,7 +634,7 @@ with gr.Blocks(css=css) as demo:
                 with gr.Row():
                     seed_textbox = gr.Textbox(label="Seed", value=1337)
                     seed_button = gr.Button(value="\U0001f3b2", elem_classes="toolbutton")
-                seed_button.click(fn=lambda x: random.randint(1, 1e8), outputs=[seed_textbox], queue=False)
+                seed_button.click(fn=lambda x: random.randint(1, int(1e8)), outputs=[seed_textbox], queue=False)
 
                 with gr.Row():
                     overwrite_checkbox = gr.Checkbox(label="Overwrite existing outputs", value=True)
