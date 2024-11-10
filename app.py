@@ -5,6 +5,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 import gc
 import numpy as np
+from tqdm import tqdm
 
 import gradio as gr
 import soundfile as sf
@@ -12,13 +13,22 @@ import torch
 import torchvision
 from huggingface_hub import snapshot_download
 from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+from transformers import (
+    CLIPImageProcessor,
+    CLIPVisionModelWithProjection,
+    BitsAndBytesConfig,
+    CLIPTokenizer,
+)
 
 from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
 from foleycrafter.models.onset import torch_utils
 from foleycrafter.models.time_detector.model import VideoOnsetNet
 from foleycrafter.pipelines.auffusion_pipeline import Generator, denormalize_spectrogram
 from foleycrafter.utils.util import build_foleycrafter
+
+# Additional imports for idefics2-8b
+from transformers import AutoProcessor, AutoModelForVision2Seq
+from PIL import Image
 
 os.environ["GRADIO_TEMP_DIR"] = "./tmp"
 
@@ -31,7 +41,7 @@ scheduler_dict = {
 
 css = """
 .toolbutton {
-    margin-buttom: 0em 0em 0em 0em;
+    margin-bottom: 0em 0em 0em 0em;
     max-width: 2.5em;
     min-width: 2.5em !important;
     height: 2.5em;
@@ -123,13 +133,34 @@ class FoleyController:
             image_encoder_folder=None,
         )
 
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.float16,
+        )
+
+        # Load idefics2-8b model and processor
+        self.vision_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.processor = AutoProcessor.from_pretrained("HuggingFaceM4/idefics2-8b")
+        self.vision_model = AutoModelForVision2Seq.from_pretrained(
+            "HuggingFaceM4/idefics2-8b",
+            torch_dtype=torch.float16,
+            device_map="auto",
+            _attn_implementation="flash_attention_2",
+            quantization_config=quantization_config,
+        )
+        self.vision_model.eval()
+
+        # Initialize CLIP tokenizer
+        self.clip_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+
         print("Load Finish!")
         self.loaded = True
 
         return "Load"
 
     def read_frames_with_moviepy(self, video_path, max_frame_nums=None):
-        from moviepy.editor import VideoFileClip
         frames = []
         video = VideoFileClip(video_path)
         duration = video.duration
@@ -137,9 +168,146 @@ class FoleyController:
             frames.append(frame)
         frames = np.array(frames)
         if max_frame_nums is not None:
-            frames_idx = np.linspace(0, len(frames)-1, max_frame_nums, dtype=int)
+            frames_idx = np.linspace(0, len(frames) - 1, max_frame_nums, dtype=int)
             frames = frames[frames_idx, ...]
         return frames, duration
+
+    def generate_prompt_from_images(self, images, user_prompt):
+        messages = []
+        assistant_replies = []
+        images_list = []
+        seen_responses = set()  # Track unique responses
+
+        def clean_response(text):
+            # List of phrases to remove (including variations and synonyms)
+            phrases_to_remove = [
+                "in the image",
+                "in this image",
+                "in the picture",
+                "in this picture",
+                "pictured",
+                "shown",
+                "visible",
+                "can be seen",
+                "appears to be",
+                "appearing",
+                "displayed",
+                "depicted",
+                "present",
+                "captured",
+                "photographed",
+                "shown here",
+                "seen here",
+                "in the scene",
+                "in this scene",
+                "in the photo",
+                "in this photo",
+                "in the photograph",
+                "in this photograph",
+                "in the shot",
+                "in this shot",
+                "in view",
+                "in the frame",
+                "in this frame"
+            ]
+            
+            # Convert to lower case for case-insensitive replacement
+            text_lower = text.lower()
+            
+            # Remove each phrase and any extra spaces
+            for phrase in phrases_to_remove:
+                text_lower = text_lower.replace(phrase, "")
+            
+            # Clean up any multiple spaces and trim
+            cleaned_text = " ".join(text_lower.split())
+            
+            # Capitalize first letter
+            if cleaned_text:
+                cleaned_text = cleaned_text[0].upper() + cleaned_text[1:]
+            
+            return cleaned_text
+
+        def generate_response(prompt_text, current_images):
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }]
+            prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True)
+            inputs = self.processor(text=prompt, images=current_images, return_tensors="pt")
+            inputs = {k: v.to(self.vision_device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                generated_ids = self.vision_model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    min_length=5,
+                    no_repeat_ngram_size=2,
+                    early_stopping=True,
+                    do_sample=True,
+                    temperature=0.6,
+                    top_p=0.9,
+                    num_beams=1,
+                )
+            
+            generated_text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            for line in generated_text.strip().split("\n"):
+                if line.startswith("Assistant:"):
+                    response = line.replace("Assistant:", "").strip()
+                    return clean_response(response)
+            return ""
+
+        for idx, image in enumerate(images):
+            images_list = [image]
+            
+            # Initial prompt for sound description - removed image references
+            initial_prompt = ("Describe briefly (under 10 words) the actions causing noises, "
+                            "Focus on sound, No Visual descriptions") if idx == 0 else "What would we hear?"
+            
+            response = generate_response(initial_prompt, images_list)
+            
+            # If response indicates no sound or is empty, try ambient sound prompt
+            if response.lower() in ["nothing", "there is no sound", ""]:
+                ambient_prompt = ("Describe what ambient sounds would be present in this location "
+                                "(wind, echoes, distant traffic, etc)")
+                response = generate_response(ambient_prompt, images_list)
+            
+            # Limit response to 25 words
+            response = " ".join(response.split()[:25])
+            
+            # Only add if it's a unique response
+            if response.lower() not in seen_responses:
+                seen_responses.add(response.lower())
+                assistant_replies.append(response)
+            
+            if len(assistant_replies) >= 5:
+                break
+
+        # Combine responses into final prompt
+        generated_prompt = " ".join(assistant_replies)
+        
+        # Combine with user prompt if provided
+        combined_prompt = f"{user_prompt} {generated_prompt}" if user_prompt else generated_prompt
+
+        # Handle token limit
+        tokens = self.clip_tokenizer.tokenize(combined_prompt)
+        if len(tokens) > 77:
+            user_prompt_tokens = self.clip_tokenizer.tokenize(user_prompt) if user_prompt else []
+            max_generated_tokens = 77 - len(user_prompt_tokens)
+            
+            if max_generated_tokens <= 0:
+                combined_prompt = self.clip_tokenizer.convert_tokens_to_string(user_prompt_tokens[:77])
+            else:
+                generated_prompt_tokens = self.clip_tokenizer.tokenize(generated_prompt)
+                truncated_generated_prompt = self.clip_tokenizer.convert_tokens_to_string(
+                    generated_prompt_tokens[:max_generated_tokens]
+                )
+                combined_prompt = f"{user_prompt} {truncated_generated_prompt}" if user_prompt else truncated_generated_prompt
+
+        print(combined_prompt.strip())
+        return combined_prompt.strip()
 
     def foley(
         self,
@@ -153,6 +321,8 @@ class FoleyController:
         cfg_scale_slider,
         seed_textbox,
         overwrite_checkbox,
+        use_vision_model_checkbox,
+        chunk_duration_slider,
     ):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         generator = torch.Generator(device=device)
@@ -169,7 +339,7 @@ class FoleyController:
         video_transform = torchvision.transforms.Compose(vision_transform_list)
 
         with torch.no_grad():
-            # Move models to GPU
+            # Move models to GPU when needed
             self.time_detector = self.time_detector.to(device)
             self.pipeline = self.pipeline.to(device)
             self.vocoder = self.vocoder.to(device)
@@ -184,109 +354,132 @@ class FoleyController:
             frames_per_second = total_frames / duration
 
             # Calculate number of chunks
-            chunk_duration = 10  # Duration per chunk
+            chunk_duration = chunk_duration_slider  # Duration per chunk
             num_chunks = int(np.ceil(duration / chunk_duration))
 
             audio_outputs = []
             video_clips = []
-
             prev_latents = None  # Initialize previous latents
 
-            for chunk_idx in range(num_chunks):
-                start_time = chunk_idx * chunk_duration
-                end_time = min((chunk_idx + 1) * chunk_duration, duration)
-                chunk_duration_actual = end_time - start_time
+            # Initialize tqdm progress bar
+            progress_bar = tqdm(total=num_chunks, desc="Processing video chunks", unit="chunk")
 
-                # Get frame indices for this chunk
-                start_frame_idx = int(start_time * frames_per_second)
-                end_frame_idx = int(end_time * frames_per_second)
-                chunk_frames = frames[start_frame_idx:end_frame_idx]
+            try:
+                for chunk_idx in range(num_chunks):
+                    start_time = chunk_idx * chunk_duration
+                    end_time = min((chunk_idx + 1) * chunk_duration, duration)
+                    chunk_duration_actual = end_time - start_time
 
-                if len(chunk_frames) == 0:
-                    continue  # Skip if no frames in this chunk
+                    # Get frame indices for this chunk
+                    start_frame_idx = int(start_time * frames_per_second)
+                    end_frame_idx = int(end_time * frames_per_second)
+                    chunk_frames = frames[start_frame_idx:end_frame_idx]
 
-                # Process time frames
-                time_frames = torch.FloatTensor(chunk_frames).permute(0, 3, 1, 2)
-                time_frames = video_transform(time_frames)
-                time_frames = time_frames.to(device)
-                time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
-                preds = self.time_detector(time_frames)
-                preds = torch.sigmoid(preds)
+                    if len(chunk_frames) == 0:
+                        progress_bar.update(1)
+                        continue  # Skip if no frames in this chunk
 
-                # Prepare time condition
-                num_audio_frames = 1024
-                time_condition = [
-                    -1 if preds[0][int(i / num_audio_frames * len(chunk_frames))] < 0.5 else 1
-                    for i in range(num_audio_frames)
-                ]
-                time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-                time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
+                    if use_vision_model_checkbox:
+                        frame_interval = int(2 * frames_per_second)
+                        idefics_frames = chunk_frames[::frame_interval]
+                        idefics_images = [Image.fromarray(frame) for frame in idefics_frames]
+                        combined_prompt = self.generate_prompt_from_images(
+                            idefics_images, prompt_textbox.strip()
+                        )
+                    else:
+                        combined_prompt = prompt_textbox.strip()
 
-                # Process images for image embeddings
-                step = max(1, len(chunk_frames) // 10)
-                frames_to_process = chunk_frames[::step]
-                images = self.image_processor(images=frames_to_process, return_tensors="pt").to(device)
-                image_embeddings = self.image_encoder(**images).image_embeds
-                image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
-                neg_image_embeddings = torch.zeros_like(image_embeddings)
-                image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
+                    # Process time frames
+                    time_frames = torch.FloatTensor(chunk_frames).permute(0, 3, 1, 2)
+                    time_frames = video_transform(time_frames)
+                    time_frames = time_frames.to(device)
+                    time_frames = {"frames": time_frames.unsqueeze(0).permute(0, 2, 1, 3, 4)}
+                    preds = self.time_detector(time_frames)
+                    preds = torch.sigmoid(preds)
 
-                # Set scales and run pipeline
-                self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
-                self.pipeline.scheduler = scheduler_dict[sampler_dropdown].from_config(self.pipeline.scheduler.config)
-                self.pipeline.scheduler.config.steps_offset = 1
-                self.pipeline.scheduler.set_timesteps(sample_step_slider)
+                    # Prepare time condition
+                    num_audio_frames = 1024
+                    time_condition = [
+                        -1 if preds[0][int(i / num_audio_frames * len(chunk_frames))] < 0.5 else 1
+                        for i in range(num_audio_frames)
+                    ]
+                    time_condition = torch.FloatTensor(time_condition).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                    time_condition = time_condition.repeat(1, 1, 256, 1).to(device)
 
-                # Prepare latents
-                height = 256
-                width = 1024
-                latents_shape = (1, self.pipeline.unet.in_channels, height // 8, width // 8)
-                if prev_latents is None:
-                    latents = torch.randn(latents_shape, generator=generator, device=device)
-                else:
-                    latents = prev_latents
+                    # Process images for image embeddings
+                    step = max(1, len(chunk_frames) // 10)
+                    frames_to_process = chunk_frames[::step]
+                    images = self.image_processor(images=frames_to_process, return_tensors="pt").to(device)
+                    image_embeddings = self.image_encoder(**images).image_embeds
+                    image_embeddings = torch.mean(image_embeddings, dim=0, keepdim=True).unsqueeze(0).unsqueeze(0)
+                    neg_image_embeddings = torch.zeros_like(image_embeddings)
+                    image_embeddings = torch.cat([neg_image_embeddings, image_embeddings], dim=1).to(device)
 
-                sample = self.pipeline(
-                    prompt=prompt_textbox,
-                    negative_prompt=negative_prompt_textbox,
-                    ip_adapter_image_embeds=image_embeddings,
-                    image=time_condition,
-                    controlnet_conditioning_scale=float(temporal_scale),
-                    num_inference_steps=sample_step_slider,
-                    height=height,
-                    width=width,
-                    output_type="pt",
-                    generator=generator,
-                    latents=latents,
-                    guidance_scale=cfg_scale_slider,
-                    return_dict=True,
-                )
+                    # Set scales and run pipeline
+                    self.pipeline.set_ip_adapter_scale(ip_adapter_scale)
+                    self.pipeline.scheduler = scheduler_dict[sampler_dropdown].from_config(
+                        self.pipeline.scheduler.config
+                    )
+                    self.pipeline.scheduler.config.steps_offset = 1
+                    self.pipeline.scheduler.set_timesteps(sample_step_slider)
 
-                # Update the latents for the next iteration
-                prev_latents = latents
+                    # Prepare latents
+                    height = 256
+                    width = 1024
+                    latents_shape = (1, self.pipeline.unet.in_channels, height // 8, width // 8)
+                    if prev_latents is None:
+                        latents = torch.randn(latents_shape, generator=generator, device=device)
+                    else:
+                        latents = prev_latents
 
-                # Process output
-                audio_img = sample.images[0]
-                audio = denormalize_spectrogram(audio_img)
-                audio = self.vocoder.inference(audio, lengths=160000)[0]
-                audio = audio[: int(chunk_duration_actual * 16000)]
-                # Ensure audio is a NumPy array on CPU
-                if isinstance(audio, torch.Tensor):
-                    audio = audio.detach().cpu().numpy()
-                audio_outputs.append(audio)
+                    sample = self.pipeline(
+                        prompt=combined_prompt,
+                        negative_prompt=negative_prompt_textbox,
+                        ip_adapter_image_embeds=image_embeddings,
+                        image=time_condition,
+                        controlnet_conditioning_scale=float(temporal_scale),
+                        num_inference_steps=sample_step_slider,
+                        height=height,
+                        width=width,
+                        output_type="pt",
+                        generator=generator,
+                        latents=latents,
+                        guidance_scale=cfg_scale_slider,
+                        return_dict=True,
+                    )
 
-                # Process video clip
-                video_clip = VideoFileClip(input_video).subclip(start_time, end_time)
-                video_clips.append(video_clip)
+                    # Update the latents for the next iteration
+                    prev_latents = latents
 
-                # Delete variables related to the chunk and free memory
-                del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio, video_clip
-                torch.cuda.empty_cache()
-                gc.collect()
+                    # Process output
+                    audio_img = sample.images[0]
+                    audio = denormalize_spectrogram(audio_img)
+                    audio = self.vocoder.inference(audio, lengths=160000)[0]
+                    audio = audio[: int(chunk_duration_actual * 16000)]
+                    if isinstance(audio, torch.Tensor):
+                        audio = audio.detach().cpu().numpy()
+                    audio_outputs.append(audio)
+
+                    # Process video clip
+                    video_clip = VideoFileClip(input_video).subclip(start_time, end_time)
+                    video_clips.append(video_clip)
+
+                    # Free up memory
+                    del time_frames, images, image_embeddings, time_condition, sample, audio_img, audio, video_clip
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                    # Update progress bar
+                    progress_bar.update(1)
+                    progress_bar.set_postfix({"Chunk": f"{chunk_idx + 1}/{num_chunks}"})
+
+            finally:
+                # Close progress bar
+                progress_bar.close()
 
             # Concatenate audio outputs
             if len(audio_outputs) == 0:
-                return None  # Return if no audio outputs
+                return None
             full_audio = np.concatenate(audio_outputs)
 
             # Adjust output directory and file names
@@ -316,8 +509,6 @@ class FoleyController:
             self.pipeline.to("cpu")
             self.vocoder.to("cpu")
             self.image_encoder.to("cpu")
-
-            # Clear GPU memory and collect garbage
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -354,9 +545,17 @@ with gr.Blocks(css=css) as demo:
                             value=list(scheduler_dict.keys())[0],
                         )
                         sample_step_slider = gr.Slider(
-                            label="Sampling steps", value=25, minimum=10, maximum=100, step=1
+                            label="Sampling steps", value=35, minimum=10, maximum=100, step=5
                         )
                     cfg_scale_slider = gr.Slider(label="CFG Scale", value=7.5, minimum=0, maximum=20)
+
+                with gr.Accordion("Advanced Settings", open=False):
+                    chunk_duration_slider = gr.Slider(
+                        label="Chunk Duration (seconds)", value=2, minimum=2, maximum=60, step=2
+                    )
+                    use_vision_model_checkbox = gr.Checkbox(
+                        label="Use Vision Model for Prompt Extraction", value=True
+                    )
 
                 with gr.Row():
                     seed_textbox = gr.Textbox(label="Seed", value=1337)
@@ -391,6 +590,8 @@ with gr.Blocks(css=css) as demo:
                 cfg_scale_slider,
                 seed_textbox,
                 overwrite_checkbox,
+                use_vision_model_checkbox,
+                chunk_duration_slider,
             ],
             outputs=[result_video],
         )
@@ -408,6 +609,8 @@ with gr.Blocks(css=css) as demo:
                     7.5,
                     12131415,
                     True,
+                    True,
+                    10,
                 ],
                 [
                     "examples/gen3/case3.mp4",
@@ -420,6 +623,8 @@ with gr.Blocks(css=css) as demo:
                     7.5,
                     45148336,
                     True,
+                    True,
+                    10,
                 ],
                 [
                     "examples/gen3/case5.mp4",
@@ -432,6 +637,8 @@ with gr.Blocks(css=css) as demo:
                     7.5,
                     1984,
                     True,
+                    True,
+                    10,
                 ],
                 [
                     "examples/gen3/case6.mp4",
@@ -444,6 +651,8 @@ with gr.Blocks(css=css) as demo:
                     7.5,
                     1337,
                     True,
+                    True,
+                    10,
                 ],
             ],
             inputs=[
@@ -457,6 +666,8 @@ with gr.Blocks(css=css) as demo:
                 cfg_scale_slider,
                 seed_textbox,
                 overwrite_checkbox,
+                use_vision_model_checkbox,
+                chunk_duration_slider,
             ],
             cache_examples=True,
             outputs=[result_video],

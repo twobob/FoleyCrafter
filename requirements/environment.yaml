@@ -24,3 +24,6 @@ dependencies:
     - moviepy==1.0.3
     - kornia==0.7.3
     - h5py==3.12.1
+    - bitsandbytes
+    - accelerate
+    - flash-attn
