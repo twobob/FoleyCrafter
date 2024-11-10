@@ -208,7 +208,9 @@ class FoleyController:
                 "in this shot",
                 "in view",
                 "in the frame",
-                "in this frame"
+                "in this frame",
+                "Silent film",
+                "Nothing.",
             ]
             
             # Convert to lower case for case-insensitive replacement
@@ -247,7 +249,7 @@ class FoleyController:
                     no_repeat_ngram_size=2,
                     early_stopping=True,
                     do_sample=True,
-                    temperature=0.6,
+                    temperature=0.7,
                     top_p=0.9,
                     num_beams=1,
                 )
@@ -306,7 +308,7 @@ class FoleyController:
                 )
                 combined_prompt = f"{user_prompt} {truncated_generated_prompt}" if user_prompt else truncated_generated_prompt
 
-        print(combined_prompt.strip())
+        print('\n', combined_prompt)
         return combined_prompt.strip()
 
     def foley(
@@ -347,7 +349,7 @@ class FoleyController:
 
             # Process video frames
             frames, duration = self.read_frames_with_moviepy(input_video)
-            max_duration = 180  # Maximum duration set to 3 minutes
+            max_duration = 600  # Maximum duration set to 5 minutes
             duration = min(duration, max_duration)
 
             total_frames = len(frames)
